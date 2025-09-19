@@ -1,0 +1,51 @@
+# Sensitive files - NEVER upload these
+service_account.json
+.env
+*.json
+!requirements.txt
+
+# Database and state files
+*.db
+email_index.db
+state/
+tmp/
+
+# Logs
+*.log
+email_backup.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Local test files
+test*.py
+!test_delegation.py
+
+# Images (keep only necessary ones)
+*.png
+*.jpg
+*.jpeg
+!hanni_logo.png
