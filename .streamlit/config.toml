@@ -1,35 +1,5 @@
- 
-# .streamlit/config.toml
-# Custom theme configuration for Hanni Email Backup System
-
-[theme]
-# Primary color - Hanni purple gradient base
-primaryColor = "#764ba2"
-
-# Background colors
-backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F7F7F7"
-
-# Text color
-textColor = "#2D3436"
-
-# Font
-font = "sans serif"  # Will use Inter from our CSS
-
-[server]
-# Hide the "Made with Streamlit" footer
-hideFooter = true
-
-# Custom favicon (add your favicon.ico to the root folder)
-favicon = "📧"
-
-[browser]
-# Tab title and header
-gatherUsageStats = false
-
-[client]
-# Show error details (set to false in production)
-showErrorDetails = false
-
-# Toolbar mode
-toolbarMode = "minimal"
+"[theme]" 
+"primaryColor = \"#764ba2\"" 
+"backgroundColor = \"#FFFFFF\"" 
+"secondaryBackgroundColor = \"#F7F7F7\"" 
+"textColor = \"#2D3436\"" 
