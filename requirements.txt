@@ -1,25 +1,2 @@
-# Streamlit Cloud Compatible Requirements
-# Minimal version that should work
-
-# Core dependencies
-streamlit==1.29.0
-pandas==2.1.3
-plotly==5.18.0
-
-# Google APIs
-google-api-python-client==2.108.0
-google-auth==2.23.4
-
-# Dropbox
-dropbox==11.36.2
-
-# Essential utilities
-python-dotenv==1.0.0
-requests==2.31.0
-Pillow==10.1.0
-
-# Remove these problematic packages for now:
-# google-auth-oauthlib  # Often causes issues
-# google-auth-httplib2  # Not needed for Streamlit app
-# tenacity  # Can be problematic
-# certifi  # Usually comes with requests
+echo streamlit==1.29.0 > requirements.txt
+echo pandas==2.1.3 >> requirements.txt
