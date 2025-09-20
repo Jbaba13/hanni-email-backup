@@ -456,7 +456,7 @@ def create_user_folder(user_email: str) -> bool:
 @retry(wait=wait_exponential(multiplier=1, min=2, max=60), stop=stop_after_attempt(10))
 def dropbox_upload_to_team_folder(user_email: str, path: str, data: bytes):
     """Upload file to team folder (centralized backup location)"""
-    global dbx  # MUST be first line after docstring
+    global dbx  # Declare global at the top of the function
     
     # Check if we have a valid Dropbox client
     if not dbx:
@@ -549,9 +549,7 @@ def dropbox_upload_to_team_folder(user_email: str, path: str, data: bytes):
             print(f"="*60)
             
             # Try to refresh the client if we have refresh token
-            new_dbx = get_dropbox_client()
-            if new_dbx:
-                dbx = new_dbx
+            dbx = get_dropbox_client()
             if dbx and attempt < 2:
                 print("🔄 Retrying with refreshed client...")
                 continue
