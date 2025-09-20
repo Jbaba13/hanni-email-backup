@@ -1,2 +1,2 @@
-echo streamlit==1.29.0 > requirements.txt
-echo pandas==2.1.3 >> requirements.txt
+streamlit
+pandas
