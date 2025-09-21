@@ -1,0 +1,15 @@
+# Streamlit and core dependencies
+streamlit==1.29.0
+pandas==2.0.3
+numpy==1.24.3
+plotly==5.18.0
+
+# Additional utilities
+python-dotenv==1.0.0
+
+# Note: These packages are for local backup.py only, not needed for Streamlit Cloud
+# But including basic versions to avoid conflicts if imported
+google-api-python-client==2.100.0
+google-auth==2.23.0
+dropbox==11.36.2
+requests==2.31.0
