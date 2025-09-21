@@ -1,119 +1,34 @@
 #!/usr/bin/env python3
 """
-Gmail -> Dropbox Team Folder Backup with Search & Retrieval
-- Backs up all emails to centralized team folder: /Hanni Email Backups/
-- Creates subfolders for each user: /Hanni Email Backups/user@domain.com/
-- Admin controls all backups, can grant read-only access per user
-- Uses Google Workspace Domain-Wide Delegation for Gmail access
-- Indexes all emails for fast search and retrieval
-
-Usage:
-  1) Set .env file with configuration
-  2) Backup mode: python -u backup.py
-  3) Search mode: python backup.py search
-
-Search Features:
-- Search by sender, subject, date range, attachments
-- Quick retrieval of specific emails
-- Export search results to CSV
-- Download individual emails from backup
-
-# Search Configuration
-INDEX_EMAILS=1                      # Enable email indexing for search
-
-Sample .env configuration for large-scale backups:
---------------------------------------------------
-# Google Workspace
-GOOGLE_DELEGATED_ADMIN=jennie@heyhanni.com
-GOOGLE_SCOPES=https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/admin.directory.user.readonly
-GOOGLE_SA_JSON=./service_account.json
-USER_DOMAIN_FILTER=heyhanni.com
-
-# Dropbox Business (Team app) - NEW REFRESH TOKEN METHOD
-DROPBOX_APP_KEY=your_app_key_here
-DROPBOX_APP_SECRET=your_app_secret_here
-DROPBOX_REFRESH_TOKEN=your_refresh_token_here  # For permanent access
-
-# Dropbox Business (Legacy token - will expire after 4 hours)
-DROPBOX_TEAM_TOKEN=sl.u.your_token_here  # Fallback only
-DROPBOX_TEAM_NAMESPACE=12777917905  # Hanni Email Backups folder ID
-
-# Backup Configuration
-BACKUP_MODE=full                    # 'full' for initial backup, 'incremental' for daily
-EARLIEST_DATE=2020-01-01            # For full backups, how far back to go
-START_DATE=2024-01-01               # For incremental backups
-USE_INCREMENTAL=1                   # Use saved state to resume
-
-# Rate Limiting (CRITICAL for large backups)
-RATE_LIMIT_DELAY=0.2                # Seconds between API calls (0.2 = 5 calls/second)
-BATCH_SIZE=50                       # Process emails in batches
-BATCH_DELAY=10                      # Seconds to pause between batches
-CHECKPOINT_INTERVAL=100             # Save progress every N messages
-AUTO_RESUME=1                       # Auto-resume on rate limit errors
-MAX_RETRIES=20                      # Max retries for rate limit errors
-
-# Optional: Slow down during business hours
-BUSINESS_HOURS_SLOWDOWN=1           # Enable business hours throttling
-BUSINESS_START=9                    # 9 AM
-BUSINESS_END=17                     # 5 PM  
-BUSINESS_HOURS_DELAY=0.5            # Slower rate during business hours
-
-# Processing limits
-MAX_USERS=0                         # 0 = all users
-MAX_MESSAGES_PER_USER=0             # 0 = all messages
-CONCURRENCY=1                       # Keep at 1 for large backups
-PAGE_SIZE=500                       # Messages per page (max 500)
-
-# Specific users (optional)
-INCLUDE_ONLY_EMAILS=jennie@heyhanni.com  # Comma-separated, or leave blank for all
-
-# Search Index
-INDEX_EMAILS=1                      # Enable email indexing for search (1=yes, 0=no)
-
-# Testing
-DRY_RUN=0                           # Set to 1 to test without uploading
-
-Requirements (pip install):
----------------------------
-google-api-python-client==2.108.0
-google-auth==2.23.4
-google-auth-oauthlib==1.1.0
-google-auth-httplib2==0.1.1
-dropbox==11.36.2
-python-dotenv==1.0.0
-tenacity==8.2.3
-requests==2.31.0
-certifi==2023.11.17
-
-Search Mode Usage:
-------------------
-python backup.py search              # Interactive search
-python backup.py rebuild-index       # Rebuild index from Dropbox
+Gmail to Dropbox Business Backup Script with Search
+Backs up emails from all Google Workspace users to Dropbox Business team folder
+Includes email search and indexing functionality
 """
 
-import base64
+# ------------------------------------------------------------------
+# Core imports
+# ------------------------------------------------------------------
 import datetime as dt
 import json
 import os
 import re
-import traceback
-import ssl
-import socket
-import urllib3
-import time
 import sqlite3
-import email
-from email import policy
-from email.parser import BytesParser
-import csv
+import ssl
+import threading
+import time
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+# Email parsing
+from email import policy
+from email.parser import BytesParser
 
 # ------------------------------------------------------------------
 # SSL Configuration - Fix SSL issues with Dropbox
 # ------------------------------------------------------------------
-# Force disable SSL verification to bypass corporate proxy/firewall issues
+import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Create unverified SSL context
@@ -274,10 +189,10 @@ def gmail_client(user_email: str):
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 # -------------------------
-# Enhanced Dropbox Client Setup with Refresh Token Support
+# Enhanced Dropbox Client Setup with FIXED Refresh Token Support for Teams
 # -------------------------
 def get_dropbox_client():
-    """Get Dropbox client with automatic token refresh"""
+    """Get Dropbox client with automatic token refresh for Business accounts"""
     
     DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
     DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY")
@@ -288,25 +203,63 @@ def get_dropbox_client():
         try:
             print("🔄 Attempting to connect with refresh token...")
             
-            # Create client with refresh token
-            dbx = dropbox.Dropbox(
+            # For Dropbox Business Team apps, we need to use DropboxTeam first
+            from dropbox import DropboxTeam, Dropbox
+            
+            # Create team client with refresh token
+            dbx_team = DropboxTeam(
                 app_key=DROPBOX_APP_KEY,
                 app_secret=DROPBOX_APP_SECRET,
                 oauth2_refresh_token=DROPBOX_REFRESH_TOKEN
             )
             
-            # Test connection
-            dbx.users_get_current_account()
-            print("✅ Connected to Dropbox using refresh token (permanent access)")
+            # Get the admin member ID to act as
+            admin_email = DELEGATED_ADMIN
             
-            # Apply namespace if configured
-            if DROPBOX_TEAM_NAMESPACE:
-                from dropbox import common
-                path_root = common.PathRoot.namespace_id(DROPBOX_TEAM_NAMESPACE)
-                dbx = dbx.with_path_root(path_root)
-                print(f"✅ Using team folder namespace: {DROPBOX_TEAM_NAMESPACE}")
+            try:
+                # Get team members
+                members_result = dbx_team.team_members_list(limit=200)
                 
-            return dbx
+                # Find the admin user
+                admin_member_id = None
+                for member in members_result.members:
+                    if member.profile.email == admin_email:
+                        admin_member_id = member.profile.team_member_id
+                        print(f"✅ Found team member: {admin_email}")
+                        break
+                
+                if not admin_member_id:
+                    # If admin not found, try to use first active member
+                    for member in members_result.members:
+                        if not member.profile.status.is_suspended():
+                            admin_member_id = member.profile.team_member_id
+                            admin_email = member.profile.email
+                            print(f"⚠️ Admin not found, using: {admin_email}")
+                            break
+                
+                if admin_member_id:
+                    # Create client as the specific user
+                    dbx = dbx_team.as_user(admin_member_id)
+                    print(f"✅ Connected as user: {admin_email}")
+                    
+                    # Apply namespace if configured
+                    if DROPBOX_TEAM_NAMESPACE:
+                        from dropbox import common
+                        path_root = common.PathRoot.namespace_id(DROPBOX_TEAM_NAMESPACE)
+                        dbx = dbx.with_path_root(path_root)
+                        print(f"✅ Using team folder namespace: {DROPBOX_TEAM_NAMESPACE}")
+                    
+                    # Store the member ID for use in requests fallback
+                    os.environ['DROPBOX_MEMBER_ID'] = admin_member_id
+                    
+                    return dbx
+                else:
+                    print("❌ Could not find any team members")
+                    return None
+                    
+            except Exception as e:
+                print(f"❌ Error getting team members: {e}")
+                return None
             
         except Exception as e:
             print(f"❌ Refresh token failed: {e}")
@@ -315,426 +268,325 @@ def get_dropbox_client():
     # Fallback to regular token (will expire after ~4 hours)
     if not DROPBOX_TEAM_TOKEN:
         print("❌ No Dropbox token available!")
-        print("   Set either DROPBOX_REFRESH_TOKEN (with APP_KEY and APP_SECRET)")
-        print("   or DROPBOX_TEAM_TOKEN in your .env file")
-        return None
-        
+        print("   Please configure either:")
+        print("   - DROPBOX_REFRESH_TOKEN + APP_KEY + APP_SECRET (recommended)")
+        print("   - DROPBOX_TEAM_TOKEN (will expire)")
+        sys.exit(1)
+    
     print("⚠️  Using regular access token (will expire after ~4 hours)")
     print("   For long backups, configure refresh token instead")
     
-    # Try the existing initialization code with regular token
-    try:
-        # Check if this is a team token or personal token
-        is_team_token = False
-        dbx = None
+    # Original team token code (fallback)
+    dbx = DropboxTeam(DROPBOX_TEAM_TOKEN)
+    
+    # Find the admin user's member ID
+    admin_email = DELEGATED_ADMIN
+    members_result = dbx.team_members_list()
+    
+    admin_member_id = None
+    for member in members_result.members:
+        if member.profile.email == admin_email:
+            admin_member_id = member.profile.team_member_id
+            print(f"✅ Admin member ID found: {admin_email}")
+            break
+    
+    if not admin_member_id:
+        print(f"⚠️  Could not find {admin_email} in Dropbox Business team")
+        print("   Will attempt to use team token directly")
         
-        try:
-            # First try as a team token
-            dbx_team = DropboxTeam(DROPBOX_TEAM_TOKEN)
-            # Test the token by making a simple API call
-            dbx_team.team_get_info()
-            is_team_token = True
-            print(f"✅ Connected to Dropbox Business (Team Token)")
-            
-            # Try to get the admin member for uploads
-            try:
-                members = dbx_team.team_members_list_v2(limit=500)
-                admin_member_id = None
-                
-                for member in members.members:
-                    if member.profile.email.lower() == DELEGATED_ADMIN.lower():
-                        admin_member_id = member.profile.team_member_id
-                        print(f"✅ Admin member ID found: {member.profile.email}")
-                        break
-                
-                if admin_member_id:
-                    # Create a user-specific client for the admin
-                    dbx_base = dbx_team.as_user(admin_member_id)
-                    
-                    # Use the team folder namespace for all operations
-                    if DROPBOX_TEAM_NAMESPACE:
-                        from dropbox import common
-                        path_root = common.PathRoot.namespace_id(DROPBOX_TEAM_NAMESPACE)
-                        dbx = dbx_base.with_path_root(path_root)
-                        print(f"✅ Using team folder namespace: {DROPBOX_TEAM_NAMESPACE}")
-                    else:
-                        dbx = dbx_base
-                else:
-                    raise Exception("Admin member not found in team")
-                    
-            except Exception as e:
-                print(f"⚠️  Could not get admin member access: {e}")
-                # Create a regular Dropbox client with the team token
-                dbx_regular = Dropbox(DROPBOX_TEAM_TOKEN)
-                
-                if DROPBOX_TEAM_NAMESPACE:
-                    # Set the namespace root for the regular client
-                    from dropbox import common
-                    path_root = common.PathRoot.namespace_id(DROPBOX_TEAM_NAMESPACE)
-                    dbx = dbx_regular.with_path_root(path_root)
-                    print(f"✅ Using regular Dropbox client with team folder namespace")
-                else:
-                    dbx = dbx_regular
-                    print(f"✅ Using regular Dropbox client (no namespace)")
+    # Apply namespace if configured  
+    if DROPBOX_TEAM_NAMESPACE:
+        from dropbox import common
+        path_root = common.PathRoot.namespace_id(DROPBOX_TEAM_NAMESPACE)
+        dbx = dbx.with_path_root(path_root)
+        print(f"✅ Using team folder namespace: {DROPBOX_TEAM_NAMESPACE}")
         
-        except AuthError as auth_err:
-            # Not a team token or invalid team token, try as personal token
-            print(f"⚠️  Not a team token or invalid team token")
-            
-            try:
-                # Try as a personal/app token
-                dbx = Dropbox(DROPBOX_TEAM_TOKEN)
-                # Test the token
-                dbx.users_get_current_account()
-                print(f"✅ Connected to Dropbox (Personal/App Token)")
-                
-                if DROPBOX_TEAM_NAMESPACE:
-                    # Try to use namespace with personal token
-                    from dropbox import common
-                    path_root = common.PathRoot.namespace_id(DROPBOX_TEAM_NAMESPACE)
-                    dbx = dbx.with_path_root(path_root)
-                    print(f"✅ Using namespace with personal token")
-                    
-            except AuthError as auth_err:
-                print(f"\n" + "="*60)
-                print(f"❌ DROPBOX TOKEN ERROR")
-                print(f"="*60)
-                print(f"The Dropbox access token is invalid or expired.")
-                print(f"\n🔧 TO FIX THIS:")
-                print(f"1. Configure refresh token (recommended for long backups)")
-                print(f"2. Or generate a new temporary token")
-                print(f"="*60)
-                dbx = None
-        
-        return dbx
-        
-    except Exception as e:
-        print(f"❌ Dropbox connection failed: {e}")
-        return None
+    return dbx
 
-# Initialize Dropbox client globally
+# Initialize Dropbox client
 dbx = get_dropbox_client()
+if not dbx:
+    print("❌ Failed to initialize Dropbox client")
+    print("   Check your Dropbox configuration:")
+    print("   - Ensure your app has team member file access")
+    print("   - Verify the refresh token is valid")
+    print("   - Check that the admin email exists in the team")
+    sys.exit(1)
 
-def create_user_folder(user_email: str) -> bool:
-    """Create user subfolder in team folder if it doesn't exist"""
-    if not dbx:
-        print(f"⚠️  No Dropbox client available for folder creation")
-        return True  # Continue anyway
-        
-    try:
-        # When using namespace root, paths are relative to the team folder
-        if DROPBOX_TEAM_NAMESPACE:
-            folder_path = f"/{user_email}"  # Relative to team folder namespace
-        else:
-            folder_path = f"{DROPBOX_TEAM_FOLDER}/{user_email}"  # Full path
-        
+# -------------------------
+# State management
+# -------------------------
+def load_state(email: str) -> Dict:
+    """Load saved state for incremental backups"""
+    state_file = STATE_DIR / f"{email}.json"
+    if state_file.exists() and USE_INCREMENTAL:
         try:
-            # Check if the client has the files_create_folder_v2 method
-            if hasattr(dbx, 'files_create_folder_v2'):
-                dbx.files_create_folder_v2(folder_path)
-                print(f"✅ Created folder: {folder_path}")
-            else:
-                print(f"⚠️  Client doesn't support folder creation, will create during upload")
-                
-        except ApiError as e:
-            error_str = str(e)
-            if "conflict" in error_str.lower() or "already_exists" in error_str.lower():
-                print(f"📁 Folder already exists: {folder_path}")
-            elif "no_write_permission" in error_str.lower():
-                print(f"⚠️  No write permission to team folder. Folder might be created automatically during upload.")
-            else:
-                print(f"⚠️  Could not create folder: {error_str[:200]}")
-        except Exception as e:
-            print(f"⚠️  Folder creation skipped: {str(e)[:100]}")
-        
-        return True
-        
-    except Exception as e:
-        print(f"⚠️  Error with folder for {user_email}: {str(e)[:100]}")
-        return True  # Continue anyway, upload might create folders automatically
-
-@retry(wait=wait_exponential(multiplier=1, min=2, max=60), stop=stop_after_attempt(10))
-def dropbox_upload_to_team_folder(user_email: str, path: str, data: bytes):
-    """Upload file to team folder (centralized backup location)"""
-    global dbx  # MUST be first line after docstring
-    
-    # Check if we have a valid Dropbox client
-    if not dbx:
-        print(f"❌ No valid Dropbox client available. Check your token permissions.")
-        return False
-    
-    # Build the full path
-    # Path comes in as: /2025/09/19/filename.eml
-    
-    # Parse the path to extract date components
-    path_parts = path.strip('/').split('/')
-    
-    # Check if we have a date structure (YYYY/MM/DD/filename)
-    if len(path_parts) >= 4:
-        # Try to parse as date structure
-        try:
-            year = path_parts[0]
-            month = path_parts[1]
-            day = path_parts[2]
-            filename = path_parts[3]
-            
-            # Validate it looks like a date
-            if (len(year) == 4 and year.isdigit() and 
-                len(month) == 2 and month.isdigit() and 
-                len(day) == 2 and day.isdigit()):
-                # Good date structure
-                if DROPBOX_TEAM_NAMESPACE:
-                    # When using namespace root, paths are relative
-                    team_path = f"/{user_email}/{year}/{month}/{day}/{filename}"
-                else:
-                    # Full path when not using namespace
-                    team_path = f"{DROPBOX_TEAM_FOLDER}/{user_email}/{year}/{month}/{day}/{filename}"
-            else:
-                # Not a date structure, just use filename
-                filename = path_parts[-1]
-                if DROPBOX_TEAM_NAMESPACE:
-                    team_path = f"/{user_email}/{filename}"
-                else:
-                    team_path = f"{DROPBOX_TEAM_FOLDER}/{user_email}/{filename}"
+            with open(state_file, "r") as f:
+                state = json.load(f)
+                # Migration: ensure all fields exist
+                if 'failed_messages' not in state:
+                    state['failed_messages'] = []
+                if 'checkpoint_msg_id' not in state:
+                    state['checkpoint_msg_id'] = None
+                if 'checkpoint_page_token' not in state:
+                    state['checkpoint_page_token'] = None
+                if 'total_processed' not in state:
+                    state['total_processed'] = len(state.get('downloaded_ids', []))
+                return state
         except:
-            # Any error, just use the filename
-            filename = path_parts[-1] if path_parts else 'email.eml'
-            if DROPBOX_TEAM_NAMESPACE:
-                team_path = f"/{user_email}/{filename}"
-            else:
-                team_path = f"{DROPBOX_TEAM_FOLDER}/{user_email}/{filename}"
-    else:
-        # Not enough parts for date structure
-        filename = path_parts[-1] if path_parts else 'email.eml'
-        if DROPBOX_TEAM_NAMESPACE:
-            team_path = f"/{user_email}/{filename}"
-        else:
-            team_path = f"{DROPBOX_TEAM_FOLDER}/{user_email}/{filename}"
+            pass
+    return {
+        'downloaded_ids': [], 
+        'last_backup': None, 
+        'failed_messages': [],
+        'checkpoint_msg_id': None,
+        'checkpoint_page_token': None,
+        'total_processed': 0
+    }
+
+def save_state(email: str, state: Dict):
+    """Save state for incremental backups with checkpoint support"""
+    state_file = STATE_DIR / f"{email}.json"
     
-    # Try multiple upload attempts
+    # Update last backup time
+    state['last_backup'] = dt.datetime.now().isoformat()
+    
+    # Save state
+    with open(state_file, "w") as f:
+        json.dump(state, f, indent=2)
+
+# -------------------------
+# Rate limiting with exponential backoff
+# -------------------------
+def handle_rate_limit_error():
+    """Handle rate limit errors with exponential backoff"""
+    global rate_limit_count
+    rate_limit_count = getattr(handle_rate_limit_error, 'count', 0) + 1
+    handle_rate_limit_error.count = rate_limit_count
+    
+    wait_time = min(300, 2 ** rate_limit_count)  # Cap at 5 minutes
+    print(f"⏳ Rate limited. Waiting {wait_time} seconds (attempt {rate_limit_count})...")
+    time.sleep(wait_time)
+    
+    return rate_limit_count < MAX_RETRIES
+
+def apply_rate_limit():
+    """Apply configured rate limiting between API calls"""
+    delay = RATE_LIMIT_DELAY
+    
+    # Increase delay during business hours if configured
+    if BUSINESS_HOURS_SLOWDOWN:
+        current_hour = dt.datetime.now().hour
+        if BUSINESS_START <= current_hour < BUSINESS_END:
+            delay = BUSINESS_HOURS_DELAY
+    
+    if delay > 0:
+        time.sleep(delay)
+
+# -------------------------
+# Gmail operations
+# -------------------------
+def list_messages(service, user_id: str, query: str = "", page_token: Optional[str] = None):
+    """List messages with proper pagination and error handling"""
+    try:
+        apply_rate_limit()
+        result = service.users().messages().list(
+            userId=user_id,
+            q=query,
+            maxResults=PAGE_SIZE,
+            pageToken=page_token
+        ).execute()
+        
+        messages = result.get('messages', [])
+        next_page_token = result.get('nextPageToken', None)
+        
+        # Reset rate limit counter on success
+        handle_rate_limit_error.count = 0
+        
+        return messages, next_page_token
+        
+    except HttpError as e:
+        if e.resp.status == 429:  # Rate limit
+            if handle_rate_limit_error():
+                return list_messages(service, user_id, query, page_token)
+            else:
+                print(f"❌ Max retries exceeded for rate limit")
+                return [], None
+        elif e.resp.status == 403:
+            print(f"❌ Permission denied for user {user_id}")
+            return [], None
+        else:
+            print(f"❌ Error listing messages: {e}")
+            return [], None
+
+def get_message_raw(service, user_id: str, msg_id: str) -> Optional[bytes]:
+    """Get raw email data with error handling and retries"""
+    try:
+        apply_rate_limit()
+        msg = service.users().messages().get(
+            userId=user_id,
+            id=msg_id,
+            format='raw'
+        ).execute()
+        
+        raw = msg.get('raw', '')
+        if raw:
+            # Reset rate limit counter on success
+            handle_rate_limit_error.count = 0
+            return base64.urlsafe_b64decode(raw)
+    except HttpError as e:
+        if e.resp.status == 429:  # Rate limit
+            if handle_rate_limit_error():
+                return get_message_raw(service, user_id, msg_id)
+        elif e.resp.status == 404:
+            print(f"⚠️  Message not found: {msg_id}")
+        else:
+            print(f"❌ Error getting message {msg_id}: {e}")
+    return None
+
+def parse_internal_date_ms(service, user_id: str, msg_id: str) -> int:
+    """Get message internal date in milliseconds"""
     for attempt in range(3):
         try:
-            # Upload to team folder
-            result = dbx.files_upload(
-                data,
-                team_path,
-                mode=WriteMode("add"),
-                autorename=True,
-                mute=True
-            )
-            
-            if attempt > 0:
-                print(f"✅ Upload successful after {attempt + 1} attempts")
-            
-            return True
-            
-        except (ssl.SSLError, socket.error, ConnectionError, TimeoutError) as e:
-            if attempt < 2:
-                print(f"⚠️  SSL/Network error (attempt {attempt + 1}/3), retrying...")
-                time.sleep(2 ** attempt)
-            else:
-                print(f"⚠️  SSL/Network error after 3 attempts")
-                return False
-                
-        except AuthError as e:
-            # Authentication error - token is invalid or expired
-            print(f"\n" + "="*60)
-            print(f"❌ AUTHENTICATION ERROR - TOKEN EXPIRED/INVALID")
-            print(f"="*60)
-            print(f"Your Dropbox token has expired or is invalid!")
-            print(f"\n🔧 SOLUTIONS:")
-            print(f"1. Use refresh token for permanent access (recommended)")
-            print(f"2. Generate a new temporary token (expires in 4 hours)")
-            print(f"\nFor refresh token setup, see documentation")
-            print(f"="*60)
-            
-            # Try to refresh the client if we have refresh token
-            new_dbx = get_dropbox_client()
-            if new_dbx:
-                dbx = new_dbx
-            if dbx and attempt < 2:
-                print("🔄 Retrying with refreshed client...")
-                continue
-            return False
-            
-        except ApiError as e:
-            error_str = str(e).lower()
-            if "conflict" in error_str or "already_exists" in error_str:
-                # File already exists, skip silently
-                return True
-            elif "not_found" in error_str:
-                # Parent folder doesn't exist, try to create it
-                try:
-                    # Create all parent folders
-                    parent_parts = team_path.split('/')[:-1]
-                    for i in range(2, len(parent_parts) + 1):
-                        partial_path = '/'.join(parent_parts[:i])
-                        try:
-                            if hasattr(dbx, 'files_create_folder_v2'):
-                                dbx.files_create_folder_v2(partial_path)
-                        except:
-                            pass  # Folder might already exist
-                    
-                    # Retry upload after creating folders
-                    if attempt < 2:
-                        time.sleep(1)
-                        continue
-                except:
-                    pass
-            elif "no_write_permission" in error_str:
-                print(f"❌ No write permission to team folder. Check Dropbox permissions.")
-                return False
-                
-            print(f"⚠️  Dropbox API error: {str(e)[:200]}")
-            if attempt < 2:
-                time.sleep(2 ** attempt)
-                continue
-            else:
-                return False
-            
-        except BadInputError as e:
-            # This is usually a token/permission issue
-            print(f"❌ Bad input error: {str(e)[:200]}")
-            print(f"   Check that the team folder allows uploads")
-            return False
-            
-        except AttributeError as e:
-            # Handle the case where dbx doesn't have files_upload method
-            print(f"❌ Client doesn't support file upload: {str(e)[:200]}")
-            # Try the fallback upload method
-            return upload_with_requests_fallback(user_email, path, data)
-            
-        except Exception as e:
-            print(f"⚠️  Unexpected error: {str(e)[:200]}")
-            if attempt < 2:
-                time.sleep(2 ** attempt)
-            else:
-                return False
+            apply_rate_limit()
+            msg = service.users().messages().get(
+                userId=user_id,
+                id=msg_id,
+                format='metadata',
+                metadataHeaders=['Date']
+            ).execute()
+            internal_date = msg.get('internalDate', '0')
+            return int(internal_date)
+        except HttpError as e:
+            if e.resp.status == 429 and attempt < 2:
+                if handle_rate_limit_error():
+                    # Retry
+                    continue
+        except Exception:
+            pass
+    return 0
+
+def _safe_filename_component(s: str, max_bytes: int = 120) -> str:
+    """Create safe filename from email subject"""
+    s = (s or "")
+    s = re.sub(r"[\x00-\x1f\x7f]", "_", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"[\\/:*?\"<>|]", "_", s)
     
-    return False
+    b = s.encode("utf-8")
+    if len(b) > max_bytes:
+        b = b[:max_bytes]
+        while True:
+            try:
+                s = b.decode("utf-8")
+                break
+            except UnicodeDecodeError:
+                b = b[:-1]
+                if not b:
+                    s = ""
+                    break
+    return s
 
-def upload_with_requests_fallback(user_email: str, path: str, data: bytes):
-    """Fallback upload using requests library when SDK fails"""
+def make_dropbox_path(internal_ts_ms: int, subject_hint: str = "", msg_id: str = "") -> str:
+    """Create path for email file (without user prefix, will be added later)"""
+    dt_utc = dt.datetime.fromtimestamp(internal_ts_ms / 1000.0, dt.timezone.utc)
+    y = dt_utc.strftime("%Y")
+    m = dt_utc.strftime("%m")
+    d = dt_utc.strftime("%d")
+    
+    hint = _safe_filename_component(subject_hint or "", max_bytes=120)
+    if not hint:
+        hint = _safe_filename_component((msg_id or "message"), max_bytes=32)
+
+    filename = f"{dt_utc.strftime('%Y%m%d_%H%M%S')}_{hint}.eml"
+    if len(filename.encode("utf-8")) > 200:
+        base = _safe_filename_component(hint, max_bytes=80)
+        filename = f"{dt_utc.strftime('%Y%m%d_%H%M%S')}_{base}.eml"
+
+    # Return path without team folder prefix (will be added in upload function)
+    path = f"/{y}/{m}/{d}/{filename}"
+    return path
+
+def extract_subject_hint(raw_bytes: bytes) -> str:
+    """Extract email subject for filename"""
     try:
-        # Try to get a valid token
-        token = None
-        if os.getenv("DROPBOX_REFRESH_TOKEN"):
-            # If we have refresh token, we need to get an access token first
-            # This would require additional implementation
-            print("❌ Refresh token fallback not implemented for requests method")
-            return False
-        elif DROPBOX_TEAM_TOKEN:
-            token = DROPBOX_TEAM_TOKEN
-        else:
-            print("❌ No Dropbox token available for fallback upload")
-            return False
-            
-        # Build proper path
-        if DROPBOX_TEAM_NAMESPACE:
-            # When using namespace, need to include it in headers
-            full_path = f"/{user_email}/{path.strip('/')}"
-            headers = {
-                'Authorization': f'Bearer {token}',
-                'Dropbox-API-Arg': json.dumps({
-                    'path': full_path,
-                    'mode': 'add',
-                    'autorename': True,
-                    'mute': True
-                }),
-                'Dropbox-API-Path-Root': json.dumps({
-                    '.tag': 'namespace_id',
-                    'namespace_id': DROPBOX_TEAM_NAMESPACE
-                }),
-                'Content-Type': 'application/octet-stream'
-            }
-        else:
-            # Regular path without namespace
-            full_path = f"{DROPBOX_TEAM_FOLDER}/{user_email}/{path.strip('/')}"
-            headers = {
-                'Authorization': f'Bearer {token}',
-                'Dropbox-API-Arg': json.dumps({
-                    'path': full_path,
-                    'mode': 'add',
-                    'autorename': True,
-                    'mute': True
-                }),
-                'Content-Type': 'application/octet-stream'
-            }
+        head = raw_bytes.split(b"\r\n\r\n", 1)[0].decode("utf-8", "ignore")
+        m = re.search(r"^Subject:\s*(.+)$", head, re.MULTILINE | re.IGNORECASE)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+def process_one_message(service, user_email: str, msg_id: str) -> int:
+    """Download and upload a single email, and index it for search"""
+    try:
+        raw_bytes = get_message_raw(service, "me", msg_id)
+        if not raw_bytes:
+            return 0
         
-        response = requests.post(
-            'https://content.dropboxapi.com/2/files/upload',
-            headers=headers,
-            data=data,
-            verify=False,
-            timeout=60
-        )
+        internal_ts_ms = parse_internal_date_ms(service, "me", msg_id)
+        if internal_ts_ms == 0:
+            print(f"⚠️  No date for {msg_id}, skipping")
+            return 0
         
-        if response.status_code == 200:
-            print(f"✅ Upload successful (requests fallback): {full_path}")
-            return True
-        elif response.status_code == 409:
-            print(f"⭕️  File already exists (requests): {full_path}")
-            return True
-        elif response.status_code == 401:
-            print(f"❌ Token expired/invalid (requests fallback)")
-            return False
+        # Use BACKUP_MODE to determine date filtering
+        if BACKUP_MODE == "full":
+            # Check against EARLIEST_DATE
+            earliest_ts = int(dt.datetime.strptime(EARLIEST_DATE, "%Y-%m-%d").timestamp() * 1000)
+            if internal_ts_ms < earliest_ts:
+                return 0  # Too old, skip
         else:
-            print(f"❌ Upload failed (requests): {response.status_code} - {response.text[:200]}")
-            return False
-            
+            # Incremental mode - check against START_DATE
+            start_ts = int(dt.datetime.strptime(START_DATE, "%Y-%m-%d").timestamp() * 1000)
+            if internal_ts_ms < start_ts:
+                return 0  # Too old for incremental
+        
+        subject_hint = extract_subject_hint(raw_bytes)
+        dropbox_path = make_dropbox_path(internal_ts_ms, subject_hint, msg_id)
+        
+        # Upload to Dropbox
+        if not DRY_RUN:
+            success = upload_to_dropbox_team(user_email, dropbox_path, raw_bytes, msg_id)
+            if not success:
+                return 0
+                
+            # Index for search if enabled
+            if INDEX_EMAILS:
+                full_path = f"{DROPBOX_TEAM_FOLDER}/{user_email}{dropbox_path}"
+                index_email(user_email, msg_id, raw_bytes, full_path, internal_ts_ms)
+        
+        return len(raw_bytes)
     except Exception as e:
-        print(f"❌ Requests fallback failed: {e}")
-        return False
+        print(f"❌ Error processing message {msg_id}: {e}")
+        return 0
 
 # -------------------------
-# State helpers
-# -------------------------
-def state_path(user_email: str) -> Path:
-    safe = re.sub(r"[^a-zA-Z0-9._@+-]", "_", user_email)
-    return STATE_DIR / f"{safe}.json"
-
-def load_state(user_email: str) -> Dict:
-    p = state_path(user_email)
-    if p.exists():
-        return json.loads(p.read_text(encoding="utf-8"))
-    return {}
-
-def save_state(user_email: str, data: Dict):
-    p = state_path(user_email)
-    p.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-# -------------------------
-# Email Index Database
+# Email Search & Indexing
 # -------------------------
 INDEX_DB = BASE_DIR / "email_index.db"
 
 def init_email_index():
-    """Initialize SQLite database for email search index"""
+    """Initialize SQLite database for email search"""
     conn = sqlite3.connect(INDEX_DB)
     cursor = conn.cursor()
     
-    # Create table for email metadata
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS email_index (
-            id TEXT PRIMARY KEY,
-            user_email TEXT NOT NULL,
-            message_id TEXT NOT NULL,
-            subject TEXT,
-            sender TEXT,
-            recipients TEXT,
-            date INTEGER,
-            date_str TEXT,
-            has_attachments BOOLEAN,
-            attachment_names TEXT,
-            size_bytes INTEGER,
-            dropbox_path TEXT,
-            body_preview TEXT,
-            labels TEXT,
-            UNIQUE(user_email, message_id)
-        )
-    ''')
+    # Create table with full-text search
+    cursor.execute('''CREATE TABLE IF NOT EXISTS email_index (
+        user_email TEXT,
+        message_id TEXT PRIMARY KEY,
+        subject TEXT,
+        sender TEXT,
+        recipients TEXT,
+        date INTEGER,
+        has_attachments INTEGER,
+        attachment_names TEXT,
+        size_bytes INTEGER,
+        dropbox_path TEXT,
+        body_preview TEXT
+    )''')
     
-    # Create indexes for common searches
+    # Create indexes for faster searching
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_email ON email_index(user_email)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_date ON email_index(date)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_sender ON email_index(sender)')
@@ -787,252 +639,218 @@ def parse_email_metadata(raw_bytes: bytes) -> Dict:
             try:
                 body_preview = msg.get_content()[:500]
             except:
-                body_preview = ""
-        
-        # Get Gmail labels if present
-        labels = ""
-        for header, value in msg.items():
-            if header.lower() == 'x-gmail-labels':
-                labels = value
-                break
+                pass
         
         return {
-            'message_id': message_id,
             'subject': subject,
             'sender': sender,
             'recipients': recipients,
             'date_str': date_str,
+            'message_id': message_id,
             'has_attachments': has_attachments,
             'attachment_names': ', '.join(attachments),
-            'body_preview': body_preview,
-            'labels': labels,
-            'size_bytes': len(raw_bytes)
+            'body_preview': body_preview
         }
     except Exception as e:
-        print(f"⚠️  Error parsing email metadata: {e}")
+        print(f"⚠️ Error parsing email metadata: {e}")
         return {}
 
 def index_email(user_email: str, msg_id: str, raw_bytes: bytes, dropbox_path: str, timestamp_ms: int):
     """Add email to search index"""
     try:
-        # Parse email metadata
         metadata = parse_email_metadata(raw_bytes)
-        if not metadata:
-            return
         
-        # Connect to database
         conn = sqlite3.connect(INDEX_DB)
         cursor = conn.cursor()
         
-        # Prepare data
-        unique_id = f"{user_email}:{msg_id}"
-        date_dt = dt.datetime.fromtimestamp(timestamp_ms / 1000.0, dt.timezone.utc)
-        
-        # Insert or update index
-        cursor.execute('''
-            INSERT OR REPLACE INTO email_index 
-            (id, user_email, message_id, subject, sender, recipients, date, date_str,
-             has_attachments, attachment_names, size_bytes, dropbox_path, body_preview, labels)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            unique_id,
-            user_email,
-            msg_id,
-            metadata.get('subject', ''),
-            metadata.get('sender', ''),
-            metadata.get('recipients', ''),
-            timestamp_ms,
-            date_dt.isoformat(),
-            metadata.get('has_attachments', False),
-            metadata.get('attachment_names', ''),
-            metadata.get('size_bytes', 0),
-            dropbox_path,
-            metadata.get('body_preview', ''),
-            metadata.get('labels', '')
-        ))
+        cursor.execute('''INSERT OR REPLACE INTO email_index 
+            (user_email, message_id, subject, sender, recipients, date, 
+             has_attachments, attachment_names, size_bytes, dropbox_path, body_preview)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (user_email, msg_id, metadata.get('subject', ''), 
+             metadata.get('sender', ''), metadata.get('recipients', ''),
+             timestamp_ms, 1 if metadata.get('has_attachments') else 0,
+             metadata.get('attachment_names', ''), len(raw_bytes),
+             dropbox_path, metadata.get('body_preview', '')))
         
         conn.commit()
         conn.close()
         
     except Exception as e:
-        print(f"⚠️  Error indexing email: {e}")
+        print(f"⚠️ Error indexing email {msg_id}: {e}")
 
-# -------------------------
-# Search Functions
-# -------------------------
-def search_emails(query: str = "", user_email: str = None, sender: str = None, 
-                  subject: str = None, start_date: str = None, end_date: str = None,
-                  has_attachments: bool = None, limit: int = 100) -> List[Dict]:
-    """
-    Search indexed emails with various filters
-    
-    Args:
-        query: General search term (searches subject, sender, recipients, body)
-        user_email: Filter by specific user
-        sender: Filter by sender email
-        subject: Filter by subject line
-        start_date: ISO format date string (YYYY-MM-DD)
-        end_date: ISO format date string (YYYY-MM-DD)
-        has_attachments: Filter by attachment presence
-        limit: Maximum results to return
-    
-    Returns:
-        List of matching email records
-    """
+def search_emails(query: str, user: Optional[str] = None, 
+                 start_date: Optional[str] = None, 
+                 end_date: Optional[str] = None,
+                 has_attachments: Optional[bool] = None) -> List[Dict]:
+    """Search indexed emails with various filters"""
     conn = sqlite3.connect(INDEX_DB)
-    conn.row_factory = sqlite3.Row  # Enable column access by name
     cursor = conn.cursor()
     
     # Build query
     conditions = []
     params = []
     
+    # Text search across multiple fields
     if query:
-        conditions.append('''
-            (subject LIKE ? OR sender LIKE ? OR recipients LIKE ? OR body_preview LIKE ?)
-        ''')
+        text_condition = '''(subject LIKE ? OR sender LIKE ? OR 
+                           recipients LIKE ? OR body_preview LIKE ?)'''
+        conditions.append(text_condition)
         query_param = f"%{query}%"
         params.extend([query_param] * 4)
     
-    if user_email:
+    # User filter
+    if user:
         conditions.append("user_email = ?")
-        params.append(user_email)
+        params.append(user)
     
-    if sender:
-        conditions.append("sender LIKE ?")
-        params.append(f"%{sender}%")
-    
-    if subject:
-        conditions.append("subject LIKE ?")
-        params.append(f"%{subject}%")
-    
+    # Date filters
     if start_date:
-        start_ts = int(dt.datetime.fromisoformat(start_date).timestamp() * 1000)
+        start_ts = int(dt.datetime.strptime(start_date, "%Y-%m-%d").timestamp() * 1000)
         conditions.append("date >= ?")
         params.append(start_ts)
     
     if end_date:
-        end_ts = int(dt.datetime.fromisoformat(end_date).timestamp() * 1000)
+        end_ts = int(dt.datetime.strptime(end_date, "%Y-%m-%d").timestamp() * 1000)
         conditions.append("date <= ?")
         params.append(end_ts)
     
+    # Attachment filter
     if has_attachments is not None:
         conditions.append("has_attachments = ?")
-        params.append(has_attachments)
+        params.append(1 if has_attachments else 0)
     
-    # Construct final query
+    # Build final query
     where_clause = " AND ".join(conditions) if conditions else "1=1"
-    query_sql = f'''
-        SELECT * FROM email_index 
-        WHERE {where_clause}
-        ORDER BY date DESC
-        LIMIT ?
-    '''
-    params.append(limit)
+    query_sql = f'''SELECT * FROM email_index 
+                   WHERE {where_clause}
+                   ORDER BY date DESC
+                   LIMIT 100'''
     
-    # Execute search
     cursor.execute(query_sql, params)
-    results = [dict(row) for row in cursor.fetchall()]
+    
+    # Format results
+    columns = [description[0] for description in cursor.description]
+    results = []
+    for row in cursor.fetchall():
+        result = dict(zip(columns, row))
+        # Format date
+        result['date_formatted'] = dt.datetime.fromtimestamp(
+            result['date'] / 1000
+        ).strftime('%Y-%m-%d %H:%M:%S')
+        # Format size
+        size_mb = result['size_bytes'] / (1024 * 1024)
+        result['size_formatted'] = f"{size_mb:.2f} MB"
+        results.append(result)
     
     conn.close()
     return results
 
-def download_email_from_index(email_id: str) -> Tuple[Optional[bytes], Optional[str]]:
-    """
-    Download a specific email from Dropbox using index
+def interactive_search():
+    """Interactive email search interface"""
+    print("\n" + "="*60)
+    print("📧 Email Search Interface")
+    print("="*60)
     
-    Args:
-        email_id: The unique ID from the index (format: user@email.com:message_id)
-    
-    Returns:
-        Tuple of (email_bytes, filename) or (None, None) if not found
-    """
-    if not dbx:
-        print("❌ No Dropbox connection available")
-        return None, None
-    
-    # Get email info from index
-    conn = sqlite3.connect(INDEX_DB)
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM email_index WHERE id = ?", (email_id,))
-    row = cursor.fetchone()
-    conn.close()
-    
-    if not row:
-        print(f"❌ Email not found in index: {email_id}")
-        return None, None
-    
-    # Download from Dropbox
-    try:
-        dropbox_path = row[11]  # dropbox_path column
+    while True:
+        print("\n🔍 Search Options:")
+        print("1. Text search (subject, sender, body)")
+        print("2. Search by user")
+        print("3. Search by date range")
+        print("4. Find emails with attachments")
+        print("5. Advanced search (combine filters)")
+        print("6. Exit search")
         
-        # Download file
-        metadata, response = dbx.files_download(dropbox_path)
-        email_bytes = response.content
+        choice = input("\nSelect option (1-6): ").strip()
         
-        # Generate filename from path
-        filename = os.path.basename(dropbox_path)
+        if choice == "1":
+            query = input("Enter search text: ").strip()
+            results = search_emails(query)
+            
+        elif choice == "2":
+            user = input("Enter user email: ").strip()
+            results = search_emails("", user=user)
+            
+        elif choice == "3":
+            start = input("Start date (YYYY-MM-DD) or press Enter to skip: ").strip()
+            end = input("End date (YYYY-MM-DD) or press Enter to skip: ").strip()
+            results = search_emails("", 
+                                  start_date=start if start else None,
+                                  end_date=end if end else None)
+            
+        elif choice == "4":
+            results = search_emails("", has_attachments=True)
+            
+        elif choice == "5":
+            query = input("Search text (or press Enter to skip): ").strip()
+            user = input("User email (or press Enter to skip): ").strip()
+            start = input("Start date YYYY-MM-DD (or press Enter to skip): ").strip()
+            end = input("End date YYYY-MM-DD (or press Enter to skip): ").strip()
+            attach = input("Has attachments? (y/n or press Enter to skip): ").strip().lower()
+            
+            has_attach = True if attach == 'y' else (False if attach == 'n' else None)
+            
+            results = search_emails(
+                query if query else "",
+                user=user if user else None,
+                start_date=start if start else None,
+                end_date=end if end else None,
+                has_attachments=has_attach
+            )
+            
+        elif choice == "6":
+            print("👋 Exiting search...")
+            break
+            
+        else:
+            print("❌ Invalid option")
+            continue
         
-        print(f"✅ Downloaded: {filename}")
-        return email_bytes, filename
-        
-    except Exception as e:
-        print(f"❌ Error downloading email: {e}")
-        return None, None
+        # Display results
+        if results:
+            print(f"\n📊 Found {len(results)} results:")
+            print("-" * 80)
+            
+            for i, email in enumerate(results[:10], 1):  # Show first 10
+                print(f"\n{i}. {email['subject']}")
+                print(f"   From: {email['sender']}")
+                print(f"   To: {email['recipients'][:50]}...")
+                print(f"   Date: {email['date_formatted']}")
+                print(f"   Size: {email['size_formatted']}")
+                if email['has_attachments']:
+                    print(f"   📎 Attachments: {email['attachment_names']}")
+                print(f"   Path: {email['dropbox_path']}")
+                print(f"   Preview: {email['body_preview'][:100]}...")
+            
+            if len(results) > 10:
+                print(f"\n... and {len(results) - 10} more results")
+                
+            # Export option
+            export = input("\n💾 Export results to CSV? (y/n): ").strip().lower()
+            if export == 'y':
+                export_search_results(results)
+        else:
+            print("\n❌ No results found")
 
-def export_search_results(results: List[Dict], output_file: str = "search_results.csv"):
+def export_search_results(results: List[Dict]):
     """Export search results to CSV file"""
-    if not results:
-        print("No results to export")
-        return
+    import csv
     
-    # Write CSV
-    with open(output_file, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=results[0].keys())
-        writer.writeheader()
-        writer.writerows(results)
+    filename = f"email_search_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     
-    print(f"✅ Exported {len(results)} results to {output_file}")
-
-def print_search_results(results: List[Dict], verbose: bool = False):
-    """Pretty print search results"""
-    if not results:
-        print("No emails found matching search criteria")
-        return
+    with open(filename, 'w', newline='', encoding='utf-8') as f:
+        if results:
+            writer = csv.DictWriter(f, fieldnames=results[0].keys())
+            writer.writeheader()
+            writer.writerows(results)
     
-    print(f"\n📧 Found {len(results)} matching emails:\n")
-    print("-" * 80)
-    
-    for i, email in enumerate(results, 1):
-        date = dt.datetime.fromtimestamp(email['date'] / 1000).strftime('%Y-%m-%d %H:%M')
-        subject = email['subject'][:50] + "..." if len(email['subject']) > 50 else email['subject']
-        sender = email['sender'][:30] + "..." if len(email['sender']) > 30 else email['sender']
-        
-        print(f"{i:3}. [{date}] {subject}")
-        print(f"     From: {sender}")
-        print(f"     User: {email['user_email']}")
-        
-        if email['has_attachments']:
-            print(f"     📎 Attachments: {email['attachment_names'][:60]}...")
-        
-        if verbose and email['body_preview']:
-            preview = email['body_preview'][:100].replace('\n', ' ')
-            print(f"     Preview: {preview}...")
-        
-        print(f"     ID: {email['id']}")
-        print("-" * 80)
-    
-    print(f"\n💡 To download an email, use: download_email_from_index('email_id')")
+    print(f"✅ Results exported to {filename}")
 
 def rebuild_index_from_dropbox():
-    """Rebuild search index by scanning all .eml files in Dropbox"""
+    """Rebuild search index from existing Dropbox files"""
     print("\n🔄 Rebuilding email search index from Dropbox...")
     
-    if not dbx:
-        print("❌ No Dropbox connection available")
-        return
-    
-    # Initialize fresh database
+    # Backup existing index
     if INDEX_DB.exists():
         backup_name = f"{INDEX_DB}.backup.{int(time.time())}"
         os.rename(INDEX_DB, backup_name)
@@ -1096,656 +914,427 @@ def rebuild_index_from_dropbox():
                         print(f"   Indexed {i}/{len(eml_files)} emails...")
                         
             except Exception as e:
-                print(f"⚠️  Error indexing {file_entry.path_display}: {e}")
+                print(f"⚠️ Error indexing {file_entry.path_display}: {e}")
                 continue
         
         print(f"\n✅ Index rebuilt successfully!")
-        print(f"   Total emails indexed: {indexed_count}")
+        print(f"📊 Total emails indexed: {indexed_count}")
         
     except Exception as e:
         print(f"❌ Error rebuilding index: {e}")
 
-def interactive_search():
-    """Interactive command-line search interface"""
-    print("\n" + "="*60)
-    print("📧 Email Search & Retrieval System")
-    print("="*60)
-    
-    # Show index statistics
-    try:
-        conn = sqlite3.connect(INDEX_DB)
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM email_index")
-        total = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(DISTINCT user_email) FROM email_index")
-        users = cursor.fetchone()[0]
-        conn.close()
-        print(f"\n📊 Index contains {total:,} emails from {users} users")
-    except:
-        print("\n⚠️  Index not found or empty. Run a backup first or rebuild index.")
-    
-    while True:
-        print("\nSearch Options:")
-        print("1. Quick search (all fields)")
-        print("2. Search by sender")
-        print("3. Search by subject")
-        print("4. Search by date range")
-        print("5. Search emails with attachments")
-        print("6. Advanced search")
-        print("7. Download email by ID")
-        print("8. Export last search to CSV")
-        print("9. Rebuild index from Dropbox")
-        print("0. Exit search")
-        
-        choice = input("\nEnter choice (0-9): ").strip()
-        
-        if choice == '1':
-            query = input("Enter search term: ").strip()
-            results = search_emails(query=query)
-            print_search_results(results)
-            
-        elif choice == '2':
-            sender = input("Enter sender email/name: ").strip()
-            results = search_emails(sender=sender)
-            print_search_results(results)
-            
-        elif choice == '3':
-            subject = input("Enter subject text: ").strip()
-            results = search_emails(subject=subject)
-            print_search_results(results)
-            
-        elif choice == '4':
-            start = input("Enter start date (YYYY-MM-DD): ").strip()
-            end = input("Enter end date (YYYY-MM-DD): ").strip()
-            results = search_emails(start_date=start, end_date=end)
-            print_search_results(results)
-            
-        elif choice == '5':
-            results = search_emails(has_attachments=True)
-            print_search_results(results)
-            
-        elif choice == '6':
-            print("\nAdvanced Search (leave blank to skip)")
-            query = input("General search term: ").strip() or None
-            user = input("User email: ").strip() or None
-            sender = input("Sender: ").strip() or None
-            subject = input("Subject: ").strip() or None
-            start = input("Start date (YYYY-MM-DD): ").strip() or None
-            end = input("End date (YYYY-MM-DD): ").strip() or None
-            attachments = input("Has attachments (y/n): ").strip().lower()
-            has_attach = True if attachments == 'y' else False if attachments == 'n' else None
-            
-            results = search_emails(
-                query=query, user_email=user, sender=sender,
-                subject=subject, start_date=start, end_date=end,
-                has_attachments=has_attach
-            )
-            print_search_results(results, verbose=True)
-            
-        elif choice == '7':
-            email_id = input("Enter email ID: ").strip()
-            email_bytes, filename = download_email_from_index(email_id)
-            if email_bytes:
-                save_path = input(f"Save as ({filename}): ").strip() or filename
-                with open(save_path, 'wb') as f:
-                    f.write(email_bytes)
-                print(f"✅ Email saved to {save_path}")
-                
-        elif choice == '8':
-            if 'results' in locals():
-                filename = input("Export filename (search_results.csv): ").strip() or "search_results.csv"
-                export_search_results(results, filename)
-            else:
-                print("No search results to export")
-                
-        elif choice == '9':
-            confirm = input("Rebuild index from Dropbox? This may take a while (y/n): ").strip().lower()
-            if confirm == 'y':
-                rebuild_index_from_dropbox()
-                
-        elif choice == '0':
-            break
-        
-        else:
-            print("Invalid choice")
-
 # -------------------------
-# Rate Limiting & Quota Management
+# Dropbox upload with retries and SSL fallback
 # -------------------------
-class RateLimiter:
-    """Intelligent rate limiter for Google API calls"""
-    def __init__(self):
-        self.last_call = 0
-        self.calls_today = 0
-        self.quota_reset = None
-        self.consecutive_errors = 0
-        
-    def wait_if_needed(self):
-        """Apply rate limiting based on configuration"""
-        now = time.time()
-        
-        # Check if we're in business hours (for slower processing)
-        if BUSINESS_HOURS_SLOWDOWN:
-            current_hour = dt.datetime.now().hour
-            if BUSINESS_START <= current_hour < BUSINESS_END:
-                delay = BUSINESS_HOURS_DELAY
-            else:
-                delay = RATE_LIMIT_DELAY
-        else:
-            delay = RATE_LIMIT_DELAY
-        
-        # Apply minimum delay between calls
-        elapsed = now - self.last_call
-        if elapsed < delay:
-            time.sleep(delay - elapsed)
-        
-        self.last_call = time.time()
-        self.calls_today += 1
-        
-    def handle_rate_limit_error(self, retry_after=None):
-        """Handle 429 rate limit errors with exponential backoff"""
-        self.consecutive_errors += 1
-        
-        if retry_after:
-            wait_time = retry_after
-        else:
-            # Exponential backoff: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512 seconds
-            wait_time = min(2 ** self.consecutive_errors, 512)
-        
-        print(f"⏳ Rate limited. Waiting {wait_time} seconds (attempt {self.consecutive_errors}/{MAX_RETRIES})")
-        
-        # Show countdown for long waits
-        if wait_time > 10:
-            for remaining in range(int(wait_time), 0, -10):
-                print(f"   Resuming in {remaining} seconds...")
-                time.sleep(min(10, remaining))
-        else:
-            time.sleep(wait_time)
-        
-        return self.consecutive_errors < MAX_RETRIES
-        
-    def reset_error_count(self):
-        """Reset consecutive error count on successful call"""
-        if self.consecutive_errors > 0:
-            print(f"✅ Recovered from rate limiting after {self.consecutive_errors} retries")
-        self.consecutive_errors = 0
-
-rate_limiter = RateLimiter()
-
-# -------------------------
-# Users listing (Admin SDK)
-# -------------------------
-def list_users() -> List[str]:
-    """List all users in the domain or use INCLUDE_ONLY if specified"""
+def upload_to_dropbox_team(user_email: str, path: str, data: bytes, msg_id: str = "") -> bool:
+    """Upload file to Dropbox team folder with user subfolder"""
     
-    # If specific users are listed, just use those
-    if INCLUDE_ONLY:
-        print(f"📋 Using specified users from INCLUDE_ONLY_EMAILS")
-        return [email for email in INCLUDE_ONLY if email]
+    # Check if Dropbox client exists
+    if not dbx:
+        print("❌ No Dropbox connection. Check your token.")
+        return False
     
-    try:
-        svc = admin_directory()
-        users: List[str] = []
-        page_token = None
-        params = {"customer": "my_customer", "maxResults": 200, "orderBy": "email"}
-
-        while True:
-            if page_token:
-                params["pageToken"] = page_token
-            if USER_DOMAIN_FILTER:
-                params["domain"] = USER_DOMAIN_FILTER
-
-            resp = svc.users().list(**params).execute()
-            for u in resp.get("users", []):
-                if u.get("suspended"):
-                    continue
-                primary = u.get("primaryEmail")
-                if primary:
-                    users.append(primary)
-
-            page_token = resp.get("nextPageToken")
-            if not page_token:
-                break
-
-        # Apply MAX_USERS limit if set
-        if MAX_USERS and MAX_USERS > 0:
-            users = users[:MAX_USERS]
-            
-        return users
-        
-    except Exception as e:
-        print(f"⚠️  Could not list users via Admin SDK: {e}")
-        if INCLUDE_ONLY:
-            print(f"📋 Falling back to INCLUDE_ONLY_EMAILS")
-            return [email for email in INCLUDE_ONLY if email]
-        return []
-
-# -------------------------
-# Gmail listing & download
-# -------------------------
-def iso_to_date(iso_str: str) -> dt.datetime:
-    if "T" in iso_str:
-        return dt.datetime.fromisoformat(iso_str)
-    return dt.datetime.fromisoformat(iso_str + "T00:00:00")
-
-def gmail_query_after(iso_date: str) -> str:
-    d = iso_to_date(iso_date)
-    return f"after:{d.strftime('%Y/%m/%d')}"
-
-def list_message_ids(service, user_id: str, query: Optional[str], page_size: int) -> List[str]:
-    """List all message IDs matching the query (or ALL if query is None)"""
-    ids: List[str] = []
-    page_token = None
-    pages_fetched = 0
+    # Build the full path
+    # Path comes in as: /2025/09/19/filename.eml
     
-    # Build params
-    params = {
-        "userId": user_id,
-        "maxResults": page_size
-    }
+    # Parse the path to extract date components
+    path_parts = path.strip('/').split('/')
     
-    # Only add query if provided (None means get ALL emails)
-    if query:
-        params["q"] = query
-    
-    while True:
+    # Check if we have a date structure (YYYY/MM/DD/filename)
+    if len(path_parts) >= 4:
+        # Try to parse as date structure
         try:
-            if page_token:
-                params["pageToken"] = page_token
+            year = path_parts[0]
+            month = path_parts[1]
+            day = path_parts[2]
+            filename = path_parts[3]
             
-            # Apply rate limiting
-            rate_limiter.wait_if_needed()
-            
-            req = service.users().messages().list(**params)
-            resp = req.execute()
-            
-            # Reset error count on success
-            rate_limiter.reset_error_count()
-            
-        except HttpError as e:
-            if getattr(e, "resp", None) and e.resp.status == 429:
-                # Rate limit error - use intelligent backoff
-                retry_after = None
-                if hasattr(e.resp, 'headers'):
-                    retry_after = e.resp.headers.get('Retry-After')
-                    if retry_after:
-                        retry_after = int(retry_after)
-                
-                if AUTO_RESUME and rate_limiter.handle_rate_limit_error(retry_after):
-                    continue
+            # Validate it looks like a date
+            if (len(year) == 4 and year.isdigit() and 
+                len(month) == 2 and month.isdigit() and 
+                len(day) == 2 and day.isdigit()):
+                # Good date structure
+                if DROPBOX_TEAM_NAMESPACE:
+                    # When using namespace root, paths are relative
+                    team_path = f"/{user_email}/{year}/{month}/{day}/{filename}"
                 else:
-                    print(f"❌ Rate limit exceeded after {MAX_RETRIES} retries")
-                    raise
-            elif getattr(e, "resp", None) and e.resp.status in (500, 503):
-                print(f"⚠️  Gmail API server error, waiting...")
-                time.sleep(5)
-                continue
+                    # Full path when not using namespace
+                    team_path = f"{DROPBOX_TEAM_FOLDER}/{user_email}/{year}/{month}/{day}/{filename}"
             else:
-                raise
-
-        for m in resp.get("messages", []):
-            ids.append(m["id"])
-        
-        pages_fetched += 1
-        if pages_fetched % 10 == 0:
-            print(f"   📄 Fetched {pages_fetched} pages, {len(ids)} messages so far...")
-            
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-            
-    return ids
-
-@retry(wait=wait_exponential(multiplier=1, min=2, max=60), stop=stop_after_attempt(10))
-def get_message_raw(service, user_id: str, msg_id: str) -> bytes:
-    """Get raw email data including attachments"""
-    try:
-        # Apply rate limiting
-        rate_limiter.wait_if_needed()
-        
-        msg = service.users().messages().get(userId=user_id, id=msg_id, format="raw").execute()
-        
-        # Reset error count on success
-        rate_limiter.reset_error_count()
-        
-        raw = msg.get("raw")
-        if not raw:
-            return b""
-        return base64.urlsafe_b64decode(raw.encode("utf-8"))
-        
-    except HttpError as e:
-        if getattr(e, "resp", None) and e.resp.status == 429:
-            # Rate limit error
-            retry_after = None
-            if hasattr(e.resp, 'headers'):
-                retry_after = e.resp.headers.get('Retry-After')
-                if retry_after:
-                    retry_after = int(retry_after)
-            
-            if rate_limiter.handle_rate_limit_error(retry_after):
-                raise  # Let retry decorator handle it
+                # Not a date structure, just use filename
+                filename = path_parts[-1]
+                if DROPBOX_TEAM_NAMESPACE:
+                    team_path = f"/{user_email}/{filename}"
+                else:
+                    team_path = f"{DROPBOX_TEAM_FOLDER}/{user_email}/{filename}"
+        except:
+            # Any error, just use the filename
+            filename = path_parts[-1] if path_parts else 'email.eml'
+            if DROPBOX_TEAM_NAMESPACE:
+                team_path = f"/{user_email}/{filename}"
             else:
-                print(f"❌ Giving up on message {msg_id} after rate limit retries")
-                return b""
+                team_path = f"{DROPBOX_TEAM_FOLDER}/{user_email}/{filename}"
+    else:
+        # Not enough parts for date structure
+        filename = path_parts[-1] if path_parts else 'email.eml'
+        if DROPBOX_TEAM_NAMESPACE:
+            team_path = f"/{user_email}/{filename}"
         else:
-            raise
-
-def parse_internal_date_ms(service, user_id: str, msg_id: str) -> int:
-    """Get email timestamp"""
-    try:
-        # Apply rate limiting
-        rate_limiter.wait_if_needed()
-        
-        meta = service.users().messages().get(userId=user_id, id=msg_id, format="metadata").execute()
-        
-        # Reset error count on success
-        rate_limiter.reset_error_count()
-        
-        return int(meta.get("internalDate", "0"))
-        
-    except HttpError as e:
-        if getattr(e, "resp", None) and e.resp.status == 429:
-            # Rate limit error
-            if rate_limiter.handle_rate_limit_error():
-                # Retry
-                return parse_internal_date_ms(service, user_id, msg_id)
-        return 0
-
-def _safe_filename_component(s: str, max_bytes: int = 120) -> str:
-    """Create safe filename from email subject"""
-    s = (s or "")
-    s = re.sub(r"[\x00-\x1f\x7f]", "_", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    s = re.sub(r"[\\/:*?\"<>|]", "_", s)
+            team_path = f"{DROPBOX_TEAM_FOLDER}/{user_email}/{filename}"
     
-    b = s.encode("utf-8")
-    if len(b) > max_bytes:
-        b = b[:max_bytes]
-        while True:
-            try:
-                s = b.decode("utf-8")
-                break
-            except UnicodeDecodeError:
-                b = b[:-1]
-                if not b:
-                    s = ""
-                    break
-    return s
-
-def make_dropbox_path(internal_ts_ms: int, subject_hint: str = "", msg_id: str = "") -> str:
-    """Create path for email file (without user prefix, will be added later)"""
-    dt_utc = dt.datetime.fromtimestamp(internal_ts_ms / 1000.0, dt.timezone.utc)
-    y = dt_utc.strftime("%Y")
-    m = dt_utc.strftime("%m")
-    d = dt_utc.strftime("%d")
-    
-    hint = _safe_filename_component(subject_hint or "", max_bytes=120)
-    if not hint:
-        hint = _safe_filename_component((msg_id or "message"), max_bytes=32)
-
-    filename = f"{dt_utc.strftime('%Y%m%d_%H%M%S')}_{hint}.eml"
-    if len(filename.encode("utf-8")) > 200:
-        base = _safe_filename_component(hint, max_bytes=80)
-        filename = f"{dt_utc.strftime('%Y%m%d_%H%M%S')}_{base}.eml"
-
-    # Return path without team folder prefix (will be added in upload function)
-    path = f"/{y}/{m}/{d}/{filename}"
-    return path
-
-def extract_subject_hint(raw_bytes: bytes) -> str:
-    """Extract email subject for filename"""
-    try:
-        head = raw_bytes.split(b"\r\n\r\n", 1)[0].decode("utf-8", "ignore")
-        m = re.search(r"^Subject:\s*(.+)$", head, re.MULTILINE | re.IGNORECASE)
-        if m:
-            return m.group(1)
-    except Exception:
-        pass
-    return ""
-
-def process_one_message(service, user_email: str, msg_id: str) -> int:
-    """Download and upload a single email, and index it for search"""
-    try:
-        raw_bytes = get_message_raw(service, "me", msg_id)
-        if not raw_bytes:
-            return 0
+    # Try multiple upload attempts
+    for attempt in range(3):
+        try:
+            # Try native Dropbox SDK upload first
+            dbx.files_upload(
+                data, 
+                team_path,
+                mode=WriteMode('add'),
+                autorename=True,
+                mute=True
+            )
             
-        ts_ms = parse_internal_date_ms(service, "me", msg_id)
-        subject_hint = extract_subject_hint(raw_bytes)
-        dbx_path = make_dropbox_path(ts_ms, subject_hint, msg_id)
-        
-        if not DRY_RUN:
-            # Upload to team folder
-            if dropbox_upload_to_team_folder(user_email, dbx_path, raw_bytes):
-                # Index the email for search (if enabled)
-                if INDEX_EMAILS:
-                    # Build the full Dropbox path for the index
-                    if DROPBOX_TEAM_NAMESPACE:
-                        full_dbx_path = f"/{user_email}{dbx_path}"
-                    else:
-                        full_dbx_path = f"{DROPBOX_TEAM_FOLDER}/{user_email}{dbx_path}"
+            print(f"✅ Upload successful: {team_path}")
+            return True
+            
+        except ApiError as e:
+            if hasattr(e, 'error'):
+                error = e.error
+                
+                # Check for path conflict (file already exists)
+                if hasattr(error, 'is_path') and error.is_path():
+                    path_error = error.get_path()
+                    if hasattr(path_error, 'is_conflict') and path_error.is_conflict():
+                        print(f"⭕️ File already exists: {team_path}")
+                        return True  # Consider it successful
+                
+                # Check for insufficient space
+                if hasattr(error, 'is_path') and error.is_path():
+                    path_error = error.get_path()
+                    if hasattr(path_error, 'is_insufficient_space') and path_error.is_insufficient_space():
+                        print(f"❌ Insufficient space in Dropbox")
+                        return False
+            
+            # For SSL or other connection errors, try fallback
+            if "SSL" in str(e) or "CERTIFICATE" in str(e).upper() or attempt < 2:
+                print(f"⚠️ Upload attempt {attempt + 1} failed: {e}")
+                if attempt < 2:
+                    time.sleep(2 ** attempt)  # Exponential backoff
                     
-                    index_email(user_email, msg_id, raw_bytes, full_dbx_path, ts_ms)
+                    # Try with requests as fallback on last attempt
+                    if attempt == 1:
+                        print("🔄 Trying requests library fallback...")
+                        return upload_with_requests_fallback(user_email, path, data, team_path)
+            else:
+                print(f"❌ Upload failed: {e}")
+                return False
+                
+        except AuthError as e:
+            print(f"❌ Authentication error: {e}")
+            print("   Check your Dropbox token")
+            return False
             
-        return ts_ms
-        
-    except Exception as e:
-        print(f"[{user_email}] Failed to process message {msg_id}: {e}")
-        return 0
+        except Exception as e:
+            print(f"⚠️ Unexpected error on attempt {attempt + 1}: {e}")
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+            else:
+                # Last resort - try requests fallback
+                print("🔄 Final attempt with requests fallback...")
+                return upload_with_requests_fallback(user_email, path, data, team_path)
+    
+    return False
 
-def backup_user(user_email: str) -> Dict[str, int]:
-    """Backup all emails for a specific user with intelligent rate limiting and checkpointing"""
-    global dbx  # Declare global at the top of the function
+def upload_with_requests_fallback(user_email: str, path: str, data: bytes, full_path: str) -> bool:
+    """Fallback upload using requests library when Dropbox SDK fails"""
+    import json
+    import requests
+    
+    # Try to get an access token
+    DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
+    DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY")
+    DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET")
+    
+    if DROPBOX_REFRESH_TOKEN and DROPBOX_APP_KEY and DROPBOX_APP_SECRET:
+        # Get a fresh access token from refresh token
+        try:
+            token_response = requests.post(
+                'https://api.dropboxapi.com/oauth2/token',
+                data={
+                    'grant_type': 'refresh_token',
+                    'refresh_token': DROPBOX_REFRESH_TOKEN,
+                    'client_id': DROPBOX_APP_KEY,
+                    'client_secret': DROPBOX_APP_SECRET
+                }
+            )
+            
+            if token_response.status_code == 200:
+                token_data = token_response.json()
+                token = token_data.get('access_token')
+                print("🔑 Got fresh access token for requests fallback")
+            else:
+                print("❌ Failed to get access token from refresh token")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Error getting access token: {e}")
+            return False
+    else:
+        # Fall back to regular token if available
+        token = DROPBOX_TEAM_TOKEN
+        if not token:
+            print("❌ No access token available for fallback")
+            return False
+    
+    try:
+        # Get member ID if available
+        member_id = os.getenv('DROPBOX_MEMBER_ID')
+        
+        # Build headers based on namespace usage
+        if DROPBOX_TEAM_NAMESPACE:
+            # When using namespace, need to include it in headers
+            full_path = f"/{user_email}/{path.strip('/')}"
+            headers = {
+                'Authorization': f'Bearer {token}',
+                'Dropbox-API-Arg': json.dumps({
+                    'path': full_path,
+                    'mode': 'add',
+                    'autorename': True,
+                    'mute': True
+                }),
+                'Dropbox-API-Path-Root': json.dumps({
+                    '.tag': 'namespace_id',
+                    'namespace_id': DROPBOX_TEAM_NAMESPACE
+                }),
+                'Content-Type': 'application/octet-stream'
+            }
+        else:
+            # Regular path without namespace
+            full_path = f"{DROPBOX_TEAM_FOLDER}/{user_email}/{path.strip('/')}"
+            headers = {
+                'Authorization': f'Bearer {token}',
+                'Dropbox-API-Arg': json.dumps({
+                    'path': full_path,
+                    'mode': 'add',
+                    'autorename': True,
+                    'mute': True
+                }),
+                'Content-Type': 'application/octet-stream'
+            }
+        
+        # Add team member selection header if we have a member ID
+        if member_id:
+            headers['Dropbox-API-Select-User'] = member_id
+            print(f"📤 Using team member: {member_id}")
+        
+        response = requests.post(
+            'https://content.dropboxapi.com/2/files/upload',
+            headers=headers,
+            data=data,
+            verify=False,
+            timeout=60
+        )
+        
+        if response.status_code == 200:
+            print(f"✅ Upload successful (requests fallback): {full_path}")
+            return True
+        elif response.status_code == 409:
+            print(f"⭕️ File already exists (requests): {full_path}")
+            return True
+        elif response.status_code == 401:
+            print(f"❌ Token expired/invalid (requests fallback)")
+            return False
+        else:
+            print(f"❌ Upload failed (requests): {response.status_code} - {response.text[:200]}")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Requests fallback failed: {e}")
+        return False
+
+# -------------------------
+# Main backup process
+# -------------------------
+def backup_user_emails(user_email: str) -> Dict:
+    """Backup all emails for a single user with checkpoint support"""
     
     print(f"\n{'='*60}")
-    print(f"📧 Starting backup for: {user_email}")
+    print(f"👤 Processing: {user_email}")
     print(f"{'='*60}")
     
-    # Check if Dropbox client is valid (refresh if needed)
-    if not dbx:
-        print("🔄 Attempting to refresh Dropbox connection...")
-        dbx = get_dropbox_client()
-        if not dbx:
-            print(f"❌ Cannot backup without Dropbox connection")
-            return {"downloaded": 0, "failed": 0}
+    # Load state for incremental backup
+    state = load_state(user_email)
+    downloaded_ids = set(state.get('downloaded_ids', []))
+    failed_messages = state.get('failed_messages', [])
+    checkpoint_page_token = state.get('checkpoint_page_token', None)
+    total_processed = state.get('total_processed', 0)
     
-    # Create user folder in team space
-    create_user_folder(user_email)
-    
-    # Get Gmail service for this user
-    service = gmail_client(user_email)
-    
-    # Load state (to resume from previous runs)
-    st = load_state(user_email)
-    
-    # Check if we're resuming a previous backup
-    if st.get("backup_in_progress"):
-        print(f"📂 Resuming previous backup from message {st.get('messages_processed', 0)}")
-        processed_ids = set(st.get("processed_message_ids", []))
-    else:
-        processed_ids = set()
-        st["backup_in_progress"] = True
-        st["backup_started"] = dt.datetime.now().isoformat()
-        save_state(user_email, st)
-    
-    # Determine backup mode and query
-    query = None
+    # Determine query based on backup mode
     if BACKUP_MODE == "full":
-        # Full backup mode - get ALL emails or from earliest date
-        if EARLIEST_DATE != "2000-01-01":
-            query = gmail_query_after(EARLIEST_DATE)
-            print(f"📅 FULL BACKUP MODE - Getting all emails from {EARLIEST_DATE}")
-        else:
-            # No query means ALL emails
-            query = None
-            print(f"📅 FULL BACKUP MODE - Getting ALL emails (no date filter)")
+        # Full backup from EARLIEST_DATE
+        date_filter = f"after:{EARLIEST_DATE}"
+        print(f"🔄 Full backup mode - Getting all emails from {EARLIEST_DATE}")
     else:
-        # Incremental mode
-        if USE_INCREMENTAL and "last_iso" in st:
-            # Continue from where we left off
-            after_iso = st.get("last_iso", START_DATE)
-            query = gmail_query_after(after_iso)
-            print(f"📅 INCREMENTAL MODE - Getting emails from {after_iso}")
+        # Incremental backup
+        if state.get('last_backup'):
+            # Resume from last backup
+            last_backup_date = state['last_backup'].split('T')[0]
+            date_filter = f"after:{last_backup_date}"
+            print(f"🔄 Incremental mode - Getting emails after {last_backup_date}")
         else:
-            # First run in incremental mode - use START_DATE
-            after_iso = START_DATE
-            query = gmail_query_after(after_iso)
-            print(f"📅 INCREMENTAL MODE (first run) - Getting emails from {after_iso}")
-
-    # Get list of messages (or use cached list if resuming)
-    if st.get("backup_in_progress") and "all_message_ids" in st:
-        print(f"📋 Using cached message list from previous run")
-        msg_ids = st["all_message_ids"]
-        # Filter out already processed messages
-        msg_ids = [mid for mid in msg_ids if mid not in processed_ids]
-        print(f"📊 {len(processed_ids)} already processed, {len(msg_ids)} remaining")
-    else:
-        print(f"🔍 Fetching message list (this may take a while for large mailboxes)...")
-        start_fetch = time.time()
-        msg_ids = list_message_ids(service, "me", query, PAGE_SIZE)
-        fetch_duration = time.time() - start_fetch
-        print(f"📊 Found {len(msg_ids)} messages in {fetch_duration/60:.1f} minutes")
-        
-        # Cache the message list for resume capability
-        st["all_message_ids"] = msg_ids
-        st["total_messages"] = len(msg_ids)
-        save_state(user_email, st)
-
-    total_messages = st.get("total_messages", len(msg_ids))
-
-    # Warning for large backups
-    if total_messages > 1000:
-        print(f"⚠️  Large backup detected: {total_messages} total emails")
-        estimated_hours = (total_messages * (RATE_LIMIT_DELAY + 0.5)) / 3600
-        print(f"⏱️  Estimated time: {estimated_hours:.1f} hours at current rate limit settings")
-        print(f"💡 Tip: This backup can be safely interrupted and resumed")
-        if total_messages > 10000:
-            print(f"🌙 Consider running overnight or over a weekend")
-
-    if MAX_MSGS and len(msg_ids) > MAX_MSGS:
-        msg_ids = msg_ids[:MAX_MSGS]
-        print(f"📉 Limited to {MAX_MSGS} messages per user setting")
-        
-    print(f"⚙️  Processing {len(msg_ids)} messages in batches of {BATCH_SIZE}")
-    print(f"   Rate limit: {RATE_LIMIT_DELAY}s/call, checkpoint every {CHECKPOINT_INTERVAL} messages")
-
-    downloaded = st.get("messages_downloaded", 0)
-    failed = st.get("messages_failed", 0)
-    latest_ts = st.get("last_ts_ms", 0)
-    messages_processed = st.get("messages_processed", 0)
-
-    if not msg_ids:
-        # Backup complete, clean up state
-        if st.get("backup_in_progress"):
-            st["backup_in_progress"] = False
-            st["backup_completed"] = dt.datetime.now().isoformat()
-            save_state(user_email, st)
-        print(f"✅ No new messages to backup for {user_email}")
-        return {"downloaded": downloaded, "failed": failed}
-
-    # Process messages in batches
-    start_time = time.time()
-    batch_count = 0
+            # First run, use START_DATE
+            date_filter = f"after:{START_DATE}"
+            print(f"🔄 First backup - Getting emails from {START_DATE}")
     
     try:
-        for batch_start in range(0, len(msg_ids), BATCH_SIZE):
-            batch_end = min(batch_start + BATCH_SIZE, len(msg_ids))
-            batch = msg_ids[batch_start:batch_end]
-            batch_count += 1
+        service = gmail_client(user_email)
+        
+        # Test access
+        profile = service.users().getProfile(userId='me').execute()
+        total_messages = profile.get('messagesTotal', 0)
+        print(f"📊 Total messages in account: {total_messages}")
+        
+        # Resume from checkpoint if available
+        if checkpoint_page_token:
+            print(f"⏩ Resuming from checkpoint (already processed: {total_processed})")
+        
+        downloaded = 0
+        failed = 0
+        total_size = 0
+        page_token = checkpoint_page_token
+        
+        while True:
+            # List messages for this page
+            messages, next_page_token = list_messages(service, 'me', date_filter, page_token)
             
-            print(f"\n📦 Processing batch {batch_count} ({batch_start+1}-{batch_end} of {len(msg_ids)})")
+            if not messages:
+                break
             
-            # Process batch with single threading for better rate limit control
-            for i, msg_id in enumerate(batch, 1):
-                try:
-                    # Skip if already processed
-                    if msg_id in processed_ids:
-                        continue
-                    
-                    # Process the message
-                    ts_ms = process_one_message(service, user_email, msg_id)
-                    
-                    if ts_ms:
-                        if ts_ms > latest_ts:
-                            latest_ts = ts_ms
-                        downloaded += 1
-                        processed_ids.add(msg_id)
-                    else:
-                        failed += 1
-                    
-                    messages_processed += 1
-                    
-                    # Checkpoint progress periodically
-                    if messages_processed % CHECKPOINT_INTERVAL == 0:
-                        print(f"💾 Checkpoint: {messages_processed}/{total_messages} messages ({downloaded} success, {failed} failed)")
-                        
-                        # Save checkpoint
-                        st["messages_processed"] = messages_processed
-                        st["messages_downloaded"] = downloaded
-                        st["messages_failed"] = failed
-                        st["last_ts_ms"] = latest_ts
-                        st["processed_message_ids"] = list(processed_ids)[-1000:]  # Keep last 1000 for resume
-                        
-                        # Calculate and show progress
-                        progress_pct = (messages_processed / total_messages) * 100
-                        elapsed = time.time() - start_time
-                        rate = messages_processed / elapsed if elapsed > 0 else 0
-                        eta = (total_messages - messages_processed) / rate if rate > 0 else 0
-                        
-                        print(f"📊 Progress: {progress_pct:.1f}% | Rate: {rate:.1f} msgs/sec | ETA: {eta/60:.1f} minutes")
-                        
-                        save_state(user_email, st)
-                    
-                    # Show progress every 10 messages
-                    if messages_processed % 10 == 0:
-                        print(f"   Processing... {messages_processed}/{total_messages} ({(messages_processed/total_messages)*100:.1f}%)", end='\r')
-                        
-                except Exception as e:
-                    print(f"\n⚠️  Error processing message {msg_id}: {str(e)[:100]}")
+            print(f"📥 Processing batch of {len(messages)} messages...")
+            
+            # Process messages in this batch
+            batch_downloaded = 0
+            for i, msg in enumerate(messages):
+                msg_id = msg['id']
+                
+                # Skip if already downloaded (unless in full mode and forcing re-download)
+                if msg_id in downloaded_ids and BACKUP_MODE != "full":
+                    continue
+                
+                # Skip if in failed list from previous attempts
+                if msg_id in failed_messages and not AUTO_RESUME:
                     failed += 1
                     continue
-            
-            # Delay between batches to avoid rate limits
-            if batch_end < len(msg_ids):
-                print(f"⏸️  Batch complete. Pausing {BATCH_DELAY} seconds before next batch...")
-                time.sleep(BATCH_DELAY)
                 
-    except KeyboardInterrupt:
-        print(f"\n\n⚠️  Backup interrupted by user. Progress saved.")
-        print(f"   Processed: {messages_processed}/{total_messages} messages")
-        print(f"   Run the script again to resume from this point.")
+                # Process the message
+                size = process_one_message(service, user_email, msg_id)
+                
+                if size > 0:
+                    downloaded += 1
+                    batch_downloaded += 1
+                    total_size += size
+                    downloaded_ids.add(msg_id)
+                    
+                    # Remove from failed list if successful
+                    if msg_id in failed_messages:
+                        failed_messages.remove(msg_id)
+                    
+                    print(f"   [{downloaded}/{total_messages}] {msg_id} ({size/1024:.1f} KB)")
+                else:
+                    failed += 1
+                    if msg_id not in failed_messages:
+                        failed_messages.append(msg_id)
+                
+                # Save checkpoint periodically
+                if (downloaded + failed) % CHECKPOINT_INTERVAL == 0:
+                    state['downloaded_ids'] = list(downloaded_ids)
+                    state['failed_messages'] = failed_messages
+                    state['checkpoint_page_token'] = page_token
+                    state['total_processed'] = total_processed + downloaded + failed
+                    save_state(user_email, state)
+                    print(f"💾 Checkpoint saved at {downloaded + failed} messages")
+                
+                # Apply batch delay if configured
+                if batch_downloaded >= BATCH_SIZE:
+                    print(f"   ⏸️ Batch limit reached, pausing for {BATCH_DELAY} seconds...")
+                    time.sleep(BATCH_DELAY)
+                    batch_downloaded = 0
+                
+                # Check max messages limit
+                if MAX_MSGS and downloaded >= MAX_MSGS:
+                    print(f"📊 Reached max messages limit ({MAX_MSGS})")
+                    break
+            
+            # Check if we should continue to next page
+            if not next_page_token:
+                break
+                
+            if MAX_MSGS and downloaded >= MAX_MSGS:
+                break
+            
+            page_token = next_page_token
+            print(f"📄 Moving to next page...")
+        
+        # Final state save
+        state['downloaded_ids'] = list(downloaded_ids)
+        state['failed_messages'] = failed_messages
+        state['checkpoint_page_token'] = None  # Clear checkpoint
+        state['total_processed'] = total_processed + downloaded + failed
+        save_state(user_email, state)
+        
+        # Report results
+        size_mb = total_size / (1024 * 1024)
+        print(f"\n✅ User backup complete: {user_email}")
+        print(f"   Downloaded: {downloaded} emails ({size_mb:.2f} MB)")
+        print(f"   Failed: {failed}")
+        print(f"   Total in state: {len(downloaded_ids)}")
+        
+        return {"downloaded": downloaded, "failed": failed, "size_mb": size_mb}
+        
+    except HttpError as e:
+        if e.resp.status == 403:
+            print(f"⚠️ No Gmail access for {user_email}")
+        else:
+            print(f"❌ Error accessing Gmail for {user_email}: {e}")
+        
+        # Save state even on error
+        state['downloaded_ids'] = list(downloaded_ids)
+        state['failed_messages'] = failed_messages
+        state['checkpoint_page_token'] = page_token if 'page_token' in locals() else None
+        state['total_processed'] = total_processed + downloaded if 'downloaded' in locals() else total_processed
+        save_state(user_email, state)
+        
+        return {"downloaded": 0, "failed": 0, "size_mb": 0}
     except Exception as e:
-        print(f"\n❌ Backup error: {e}")
-        print(f"   Progress saved. You can resume by running the script again.")
+        print(f"❌ Unexpected error for {user_email}: {e}")
+        
+        # Save state
+        if 'downloaded_ids' in locals():
+            state['downloaded_ids'] = list(downloaded_ids)
+        if 'failed_messages' in locals():
+            state['failed_messages'] = failed_messages
+        save_state(user_email, state)
+        
+        return {"downloaded": 0, "failed": 0, "size_mb": 0}
+
+def backup_single_user(email: str):
+    """Backup emails for a specific user (for testing)"""
+    print(f"\n🎯 Single user backup: {email}")
     
-    # Calculate final stats
-    duration = time.time() - start_time
+    # Initialize search index if enabled
+    if INDEX_EMAILS:
+        init_email_index()
     
-    # Save final state
-    st["messages_processed"] = messages_processed
-    st["messages_downloaded"] = downloaded
-    st["messages_failed"] = failed
-    st["last_ts_ms"] = latest_ts
+    result = backup_user_emails(email)
     
-    # Mark backup as complete if all messages processed
-    if messages_processed >= len(msg_ids):
-        st["backup_in_progress"] = False
-        st["backup_completed"] = dt.datetime.now().isoformat()
-        if BACKUP_MODE == "incremental" and latest_ts:
-            st["last_iso"] = dt.datetime.fromtimestamp(latest_ts / 1000.0, dt.timezone.utc).strftime("%Y-%m-%d")
-        # Clean up large cached data
-        st.pop("all_message_ids", None)
-        st.pop("processed_message_ids", None)
+    downloaded = result.get("downloaded", 0)
+    failed = result.get("failed", 0)
     
-    save_state(user_email, st)
-    
-    print(f"\n⏱️  Session took {duration/60:.1f} minutes")
-    print(f"📈 Session stats: {downloaded} downloaded, {failed} failed")
-    
-    if st.get("backup_in_progress"):
-        print(f"📄 Backup not complete. Run again to continue.")
+    if failed > 0:
+        print(f"\n⚠️ {failed} messages failed to download.")
+        print(f"   Run again to continue.")
     else:
-        print(f"✅ Backup complete for {user_email}!")
+        print(f"✅ Backup complete for {email}!")
 
     return {"downloaded": downloaded, "failed": failed}
 
@@ -1789,165 +1378,152 @@ Usage:
     
     # Check Dropbox connection type
     if os.getenv("DROPBOX_REFRESH_TOKEN"):
-        print(f"🔑 Using refresh token (permanent access)")
+        print(f"🔐 Using refresh token (permanent access)")
     else:
-        print(f"⚠️  Using regular token (expires after ~4 hours)")
-        print(f"   For long backups, configure refresh token")
+        print(f"⚠️ Using regular token (expires after ~4 hours)")
     
-    print("\n⚙️  Rate Limiting Configuration:")
-    print(f"   API call delay: {RATE_LIMIT_DELAY}s")
-    print(f"   Batch size: {BATCH_SIZE} messages")
-    print(f"   Batch delay: {BATCH_DELAY}s")
-    print(f"   Checkpoint interval: {CHECKPOINT_INTERVAL} messages")
-    if BUSINESS_HOURS_SLOWDOWN:
-        print(f"   Business hours slowdown: {BUSINESS_START}:00-{BUSINESS_END}:00 ({BUSINESS_HOURS_DELAY}s delay)")
-    if INDEX_EMAILS:
-        print(f"🔍 Search indexing: ENABLED")
-    else:
-        print(f"🔍 Search indexing: DISABLED (set INDEX_EMAILS=1 to enable)")
-    print("="*60 + "\n")
+    print("="*60)
     
-    # Check if we have a valid Dropbox connection
-    if not dbx:
-        print("❌ Cannot start backup without Dropbox connection")
-        print("   Please configure DROPBOX_REFRESH_TOKEN or DROPBOX_TEAM_TOKEN")
-        return
-    
-    # Initialize email index database (if enabled)
+    # Initialize search index if enabled
     if INDEX_EMAILS:
         init_email_index()
     
-    # Get list of users to backup
-    users = list_users()
-    
-    print(f"👥 Found {len(users)} user(s) to backup")
-    if MAX_USERS:
-        print(f"   (limited by MAX_USERS={MAX_USERS})")
-    
-    if not users:
-        print("❌ No users found to backup")
-        print("   Check INCLUDE_ONLY_EMAILS in .env file")
-        return
-
-    # Check for any in-progress backups
-    users_in_progress = []
-    for user_email in users:
-        st = load_state(user_email)
-        if st.get("backup_in_progress"):
-            users_in_progress.append(user_email)
-    
-    if users_in_progress:
-        print(f"\n📂 Found {len(users_in_progress)} in-progress backup(s):")
-        for user in users_in_progress:
-            st = load_state(user)
-            processed = st.get("messages_processed", 0)
-            total = st.get("total_messages", 0)
-            if total > 0:
-                print(f"   - {user}: {processed}/{total} messages ({(processed/total)*100:.1f}%)")
-            else:
-                print(f"   - {user}: backup in progress")
-
-    # Summary statistics
-    total_downloaded = 0
-    total_failed = 0
-    successful_users = 0
-    failed_users = []
-    
-    # Track overall start time
-    overall_start = time.time()
-    
-    # Backup each user
-    for i, user_email in enumerate(users, 1):
-        try:
-            print(f"\n{'='*60}")
-            print(f"[{i}/{len(users)}] USER: {user_email}")
-            print(f"{'='*60}")
+    # Get list of users
+    try:
+        directory = admin_directory()
+        
+        # Get all users - we'll filter by domain after
+        request = directory.users().list(
+            customer='my_customer',
+            maxResults=500,
+            orderBy='email'
+        )
+        
+        all_users = []
+        while request:
+            result = request.execute()
+            users = result.get('users', [])
+            all_users.extend(users)
             
-            user_start = time.time()
-            stats = backup_user(user_email)
-            user_duration = time.time() - user_start
-            
-            total_downloaded += stats["downloaded"]
-            total_failed += stats.get("failed", 0)
-            
-            if stats["downloaded"] > 0:
-                successful_users += 1
+            request = directory.users().list_next(request, result)
+        
+        # Filter to primary emails only
+        user_emails = []
+        for user in all_users:
+            email = user.get('primaryEmail', '').lower()
+            if email:
+                # Filter by domain if specified
+                if USER_DOMAIN_FILTER:
+                    if email.endswith(f"@{USER_DOMAIN_FILTER}"):
+                        # Apply include filter if specified
+                        if INCLUDE_ONLY:
+                            if any(inc in email for inc in INCLUDE_ONLY):
+                                user_emails.append(email)
+                        else:
+                            user_emails.append(email)
+                else:
+                    # No domain filter, just apply include filter
+                    if INCLUDE_ONLY:
+                        if any(inc in email for inc in INCLUDE_ONLY):
+                            user_emails.append(email)
+                    else:
+                        user_emails.append(email)
+        
+        # Apply max users limit if set
+        if MAX_USERS > 0:
+            user_emails = user_emails[:MAX_USERS]
+        
+        print(f"\n📊 Found {len(user_emails)} users to backup")
+        if INCLUDE_ONLY:
+            print(f"   Filtered to: {', '.join(INCLUDE_ONLY)}")
+        if MAX_USERS:
+            print(f"   Limited to first {MAX_USERS} users")
+        
+        for email in user_emails:
+            print(f"   • {email}")
+        
+        print("\n" + "="*60)
+        
+        # Process users based on concurrency setting
+        total_downloaded = 0
+        total_failed = 0
+        total_size_mb = 0
+        successful_users = []
+        failed_users = []
+        
+        if CONCURRENCY > 1:
+            # Parallel processing
+            print(f"🚀 Processing users in parallel (max {CONCURRENCY} concurrent)")
+            with ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
+                future_to_email = {
+                    executor.submit(backup_user_emails, email): email
+                    for email in user_emails
+                }
                 
-            print(f"⏱️  User backup session took {user_duration/60:.1f} minutes")
-            
-            # Check if this user's backup is complete
-            st = load_state(user_email)
-            if st.get("backup_in_progress"):
-                print(f"📄 Backup for {user_email} is not complete. Run again to continue.")
-            else:
-                print(f"✅ Backup for {user_email} is complete!")
+                for future in as_completed(future_to_email):
+                    email = future_to_email[future]
+                    try:
+                        result = future.result()
+                        total_downloaded += result['downloaded']
+                        total_failed += result['failed']
+                        total_size_mb += result.get('size_mb', 0)
+                        if result['downloaded'] > 0:
+                            successful_users.append(email)
+                        else:
+                            failed_users.append(email)
+                    except Exception as e:
+                        print(f"❌ Error processing {email}: {e}")
+                        failed_users.append(email)
+        else:
+            # Sequential processing (default)
+            for i, email in enumerate(user_emails, 1):
+                print(f"\n[{i}/{len(user_emails)}] Processing {email}...")
                 
-        except Exception as e:
-            print(f"❌ Failed to backup {user_email}: {e}")
-            traceback.print_exc()
-            failed_users.append(user_email)
-            continue
-    
-    # Overall duration
-    overall_duration = time.time() - overall_start
-    
-    # Final summary
-    print("\n" + "="*60)
-    print("📊 BACKUP SESSION COMPLETE")
-    print("="*60)
-    print(f"⏱️  Total session time: {overall_duration/60:.1f} minutes")
-    print(f"✅ Successful users: {successful_users}/{len(users)}")
-    if failed_users:
-        print(f"❌ Failed users: {', '.join(failed_users)}")
-    print(f"📧 Total emails uploaded: {total_downloaded}")
-    if total_failed:
-        print(f"⚠️  Failed uploads: {total_failed}")
-    print(f"🗂 All backups saved to team folder:")
-    print(f"   Location: {DROPBOX_TEAM_FOLDER}/[user-email]/")
-    if DROPBOX_TEAM_NAMESPACE:
-        print(f"   Team Folder ID: {DROPBOX_TEAM_NAMESPACE}")
-        print(f"   ✅ This is a centralized team folder (not personal space)")
-    
-    # Search index statistics
-    if INDEX_EMAILS:
-        try:
+                result = backup_user_emails(email)
+                total_downloaded += result['downloaded']
+                total_failed += result['failed']
+                total_size_mb += result.get('size_mb', 0)
+                
+                if result['downloaded'] > 0:
+                    successful_users.append(email)
+                elif result['failed'] == 0:
+                    print(f"   ℹ️ No new emails to backup")
+                else:
+                    failed_users.append(email)
+                
+                # Small delay between users to be respectful
+                if i < len(user_emails):
+                    time.sleep(2)
+        
+        # Final summary
+        print("\n" + "="*60)
+        print("📊 BACKUP SUMMARY")
+        print("="*60)
+        print(f"✅ Successful users: {len(successful_users)}")
+        for user in successful_users:
+            print(f"   • {user}")
+        
+        if failed_users:
+            print(f"\n⚠️ Failed users: {len(failed_users)}")
+            for user in failed_users:
+                print(f"   • {user}")
+        
+        print(f"\n📈 Total Statistics:")
+        print(f"   Emails downloaded: {total_downloaded:,}")
+        print(f"   Emails failed: {total_failed:,}")
+        print(f"   Total size: {total_size_mb:.2f} MB")
+        print(f"   Success rate: {(total_downloaded/(total_downloaded+total_failed)*100) if (total_downloaded+total_failed) > 0 else 0:.1f}%")
+        
+        # Search index summary
+        if INDEX_EMAILS and INDEX_DB.exists():
             conn = sqlite3.connect(INDEX_DB)
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*) FROM email_index")
-            total_indexed = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(DISTINCT user_email) FROM email_index")
-            users_indexed = cursor.fetchone()[0]
+            indexed_count = cursor.fetchone()[0]
             conn.close()
-            
-            print(f"\n🔍 Search Index Statistics:")
-            print(f"   Total emails indexed: {total_indexed:,}")
-            print(f"   Users in index: {users_indexed}")
-            print(f"   Index database: {INDEX_DB}")
-            print(f"   Run 'python backup.py search' to search emails")
-        except:
-            pass
-    
-    # Check for incomplete backups
-    incomplete = []
-    for user_email in users:
-        st = load_state(user_email)
-        if st.get("backup_in_progress"):
-            incomplete.append(user_email)
-    
-    if incomplete:
-        print(f"\n📄 INCOMPLETE BACKUPS ({len(incomplete)} users):")
-        for user in incomplete:
-            st = load_state(user)
-            processed = st.get("messages_processed", 0)
-            total = st.get("total_messages", 0)
-            if total > 0:
-                remaining = total - processed
-                eta_hours = (remaining * RATE_LIMIT_DELAY) / 3600
-                print(f"   - {user}: {processed}/{total} done, ~{eta_hours:.1f}h remaining")
-        print(f"\n💡 Run the script again to continue these backups")
-        print(f"   The script will automatically resume from where it left off")
-    else:
-        print(f"\n🎉 All backups complete!")
+            print(f"   Emails indexed: {indexed_count:,}")
+        
+        print("\n✅ Backup process complete!")
         print(f"🗂 Location: Team Folder - {DROPBOX_TEAM_FOLDER}")
         if BACKUP_MODE == "full":
             print("💡 Next steps:")
@@ -1959,6 +1535,10 @@ Usage:
             print("💡 Next steps:")
             print("   1. Schedule this script to run daily for incremental backups")
             print("   2. Use 'python backup.py search' to search backed-up emails")
+
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

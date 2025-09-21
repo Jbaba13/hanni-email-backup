@@ -1,0 +1,31 @@
+# Hanni Email Analytics Dashboard - Requirements
+# Enhanced version with all dependencies
+
+# Core Streamlit and visualization
+streamlit==1.31.0
+pandas==2.1.4
+numpy==1.26.2
+plotly==5.18.0
+
+# Google APIs (needed for backup script)
+google-api-python-client==2.108.0
+google-auth==2.25.2
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0
+
+# Dropbox API
+dropbox==11.36.2
+
+# Essential utilities
+python-dotenv==1.0.0
+requests==2.31.0
+urllib3==2.1.0
+certifi==2023.11.17
+
+# Additional for enhanced features
+Pillow==10.1.0  # Image handling
+tenacity==8.2.3  # Retry logic
+pytz==2023.3  # Timezone handling
+
+# Database
+# SQLite3 is included with Python, no need to install separately
